@@ -1,13 +1,15 @@
 <?php
-# eForm 1.4.4.6 - Electronic Form Snippet
+# eForm 1.4.4.7 - Electronic Form Snippet
 # Original created by: Raymond Irving 15-Dec-2004.
 # Extended by: Jelle Jager (TobyL) September 2006
+# Modified by: PMS August 2009
 # -----------------------------------------------------
-#
+# local revision: $Id: eform.inc.php,v 1.3 2006/11/22 14:48:50 jelle Exp $
 #
 # Captcha image support - thanks to Djamoer
 # Multi checkbox, radio, select support - thanks to Djamoer
 # Form Parser and extended validation - by Jelle Jager
+# safestring - included by PMS
 #
 # see docs/eform.htm for installation and usage information
 #
@@ -35,6 +37,14 @@
 # bugfix: Auto respond email didn't honour the &sendAsText parameter
 # bugfix: The #FUNCTION validation rule for select boxes never calls the function
 # bugfix: Validation css class isn't being added to labels.
+#
+# PMS mods...
+# bugfix: Format of the email injection attempt warning email was not correctly set.
+# The submitted data is now escaped before being inserted into the email injection
+# attempt warning email.
+# Added the safestring datatype and made it the default should none be specified.
+# Stripping of valid tags is now recursive for added protection against code injection.
+# 
 ##
 
 $GLOBALS['optionsName'] = "eform"; //name of pseudo attribute used for format settings
@@ -52,7 +62,7 @@ $_dfnMaxlength = 6;
 
 	extract($params,EXTR_SKIP); // extract params into variables
 
-	$fileVersion = '1.4.4';
+	$fileVersion = '1.4.4.7';
 	$version = isset($version)?$version:'prior to 1.4.2';
 
 	#include default language file
@@ -160,9 +170,44 @@ $tpl = eFormParseTemplate($tpl,$isDebug);
 		foreach($_POST as $name => $value){
 			if(is_array($value)){
 				//remove empty values
-				$fields[$name] = array_filter($value,create_function('$v','return (!empty($v));'));
+				$value = array_flip($value);
+				unset($value['']);
+				$fields[$name] = array_flip($value);
 			} else
-				$fields[$name]	= stripslashes(($allowhtml || $formats[$name][2]=='html')? $value:$modx->stripTags($value));
+        // PMS START
+        // Stripping tags recursively. Concerned that clever hackers
+        // could create combinations of valid and invalid markup, which
+        // when the valid markup is stripped - leaves yet more valid markup!
+        // Not sure how clever the strip_tags function is.
+        //
+        // I don't know if the stripslashes are really needed here, but I've kept
+        // them to ensure I don't break anything.
+        //
+        // First decide if we need to strip tags...
+        $dataType = stripslashes( $formats[$name][2] );
+        $stripTags = FALSE;
+        // Always strip tags for safestring type
+        if (
+          $dataType == 'safestring'
+          || ( $dataType != 'html' && ! stripslashes( $allowhtml ) )
+          )
+        {
+          $stripTags = TRUE;
+        }
+        // If we are stripping tags, do it recursively.
+        if ( $stripTags )
+        {
+          $newValue = $modx->stripTags( $value );
+          while ( $newValue != $value )
+          {
+            $value = $newValue;
+            $newValue = $modx->stripTags( $value );
+          }
+          unset( $newValue );
+        }
+        // Finally, update the value.
+        $fields[$name] = $value;
+        // PMS END
 		}
 
 		# get uploaded files
@@ -241,8 +286,19 @@ $tpl = eFormParseTemplate($tpl,$isDebug);
 						case "html":
 						case "checkbox":
 						case "string":
+            // START PMS:
+              break;
+						case 'safestring':
 						default:
-							break;
+              // default behaviour is to escape html characters
+              // since this is expected to be a plain text string
+              // that will be embedded in HTML
+              $fields[$name]=htmlspecialchars(
+                $value
+                , ENT_QUOTES
+                , $modx->config['modx_charset']
+                );
+            // END PMS
 					}
 				}//end required test
 			}
@@ -255,7 +311,6 @@ $tpl = eFormParseTemplate($tpl,$isDebug);
 			else
 				if ($eFormOnValidate($fields,$vMsg,$rMsg,$rClass)===false) return;
 	}
-
 
 	if(count($vMsg)>0 || count($rMsg)>0){
 
@@ -289,7 +344,7 @@ $tpl = eFormParseTemplate($tpl,$isDebug);
 				$modx->setPlaceholder('validationmessage',str_replace('[+ef_wrapper+]', $tmp, $_lang['ef_validation_message']));
 			else
 				$fields['validationmessage'] .= str_replace('[+ef_wrapper+]', $tmp, $_lang['ef_validation_message']);
-	} else {
+  } else {
 
 			# format report fields
 			foreach($fields as $name => $value) {
@@ -328,6 +383,12 @@ $debugText .= 'Locale<pre>'.var_export($localeInfo,true).'</pre>';
 								$value = "";
 							}
 							break;
+            // START PMS:
+            // Redundant, I know, but here for completeness.
+            case 'string':
+            case 'safestring':
+            default:
+            // END PMS
 					}
 					$fields[$name] = $value;
 				}
@@ -338,25 +399,59 @@ $debugText .= 'Locale<pre>'.var_export($localeInfo,true).'</pre>';
 			//check against email injection and replace suspect content
 			if( hasMailHeaders($fields) ){
 
-				//send email to webmaster??
+        //send email to webmaster??
 				if ($reportAbuse){ //set in snippet configuration tab
+          // PMS START
+          // This line was missing. The $isHtml passed to the PHPMailer was previously
+          // undefined. Set to true because the body constructed below is in HTML
+          $isHtml = TRUE;
+          // However, if, as suspected, the form has been the subject of a mail
+          // injection attempt - then you certainly don't want to sent yourself
+          // an unescaped HTML version of the form data...
+          // I have escaped the HTML special chars below.
+          // PMS END
+          
 					$body = $_lang['ef_mail_abuse_message'];
 					$body .="<table>";
 					foreach($fields as $key => $value)
-						$body .= "<tr><td>$key</td><td><pre>$value</pre></td></tr>";
+          // PMS START
+          {
+            $key = htmlspecialchars(
+              $key
+              , ENT_QUOTES
+              , $modx->config['modx_charset']
+              );
+            $value = htmlspecialchars(
+              $value
+              , ENT_QUOTES
+              , $modx->config['modx_charset']
+              );
+						$body .= '<tr><td>' .$key. '</td><td><pre>' .$value . '</pre></td></tr>';
+          }
+          // PMS END
 					$body .="</table>";
 					include_once "manager/includes/controls/class.phpmailer.php";
 				# send abuse alert
 					$mail = new PHPMailer();
-					$mail->IsMail();
+					if($smtp) {			
+					$mail->IsSMTP(); // send via SMTP 
+					$mail->Host = $smtp_host; // SMTP servers 
+					$mail->Port = $smtp_port; // SMTP port 
+					$mail->SMTPAuth = $smtp_auth; // turn on SMTP authentication 
+					$mail->Username = $smtp_user; // SMTP username 
+					$mail->Password = $smtp_pass; // SMTP password
+					}
+					else $mail->IsMail();
 					$mail->IsHTML($isHtml);
-					$mail->From		= $modx->config['emailsender'];
+					$mail->Sender	= $sender;
+					$mail->From	= $modx->config['emailsender'];
 					$mail->FromName	= $modx->config['site_name'];
 					$mail->Subject	= $_lang['ef_mail_abuse_subject'];
 					$mail->Body		= $body;
 					AddAddressToMailer($mail,"to",$modx->config['emailsender']);
 					$mail->send(); //ignore mail errors in this case
 				}
+
 				//return empty form with error message
 				//register css and/or javascript
 				if( isset($startupSource) ) efRegisterStartupBlock($startupSource);
@@ -436,13 +531,22 @@ $debugText .= 'Locale<pre>'.var_export($localeInfo,true).'</pre>';
 				# send form
 				//defaults to html so only test sendasText
 				$isHtml = ($sendAsText==1 || strstr($sendAsText,'report'))?false:true;
-
-				if(!$noemail) {
+						
+				if(!$noemail) {	
 					if($sendirect) $to = $fields['email'];
 					$mail = new PHPMailer();
-					$mail->IsMail();
+					if($smtp) {			
+					$mail->IsSMTP(); // send via SMTP 
+					$mail->Host = $smtp_host; // SMTP servers 
+					$mail->Port = $smtp_port; // SMTP port 
+					$mail->SMTPAuth = $smtp_auth; // turn on SMTP authentication 
+					$mail->Username = $smtp_user; // SMTP username 
+					$mail->Password = $smtp_pass; // SMTP password
+					}
+					else $mail->IsMail();
 					$mail->CharSet = $modx->config['modx_charset'];
 					$mail->IsHTML($isHtml);
+					$mail->Sender	= $sender;
 					$mail->From		= $from;
 					$mail->FromName	= $fromname;
 					$mail->Subject	= $subject;
@@ -458,9 +562,18 @@ $debugText .= 'Locale<pre>'.var_export($localeInfo,true).'</pre>';
 				# send user a copy of the report
 				if($ccsender && $fields['email']) {
 					$mail = new PHPMailer();
-					$mail->IsMail();
+					if($smtp) {			
+					$mail->IsSMTP(); // send via SMTP 
+					$mail->Host = $smtp_host; // SMTP servers 
+					$mail->Port = $smtp_port; // SMTP port 
+					$mail->SMTPAuth = $smtp_auth; // turn on SMTP authentication 
+					$mail->Username = $smtp_user; // SMTP username 
+					$mail->Password = $smtp_pass; // SMTP password
+					}
+					else $mail->IsMail();
 					$mail->CharSet = $modx->config['modx_charset'];
 					$mail->IsHTML($isHtml);
+					$mail->Sender	= $sender;
 					$mail->From		= $from;
 					$mail->FromName	= $fromname;
 					$mail->Subject	= $subject;
@@ -468,34 +581,52 @@ $debugText .= 'Locale<pre>'.var_export($localeInfo,true).'</pre>';
 					AddAddressToMailer($mail,"to",$fields['email']);
 					AttachFilesToMailer($mail,$attachments);
 					if(!$mail->send()) return 'CCSender: ' . $_lang['ef_mail_error'] . $mail->ErrorInfo;
-				}
-
+				}		
+				
 				# send auto-respond email
 				//defaults to html so only test sendasText
 				$isHtml = ($sendAsText==1 || strstr($sendAsText,'autotext'))?false:true;
 				if ($autotext && $fields['email']!='') {
 					$autotext = formMerge($autotext,$fields);
 					$mail = new PHPMailer();
-					$mail->IsMail();
+					if($smtp) {			
+					$mail->IsSMTP(); // send via SMTP 
+					$mail->Host = $smtp_host; // SMTP servers 
+					$mail->Port = $smtp_port; // SMTP port 
+					$mail->SMTPAuth = $smtp_auth; // turn on SMTP authentication 
+					$mail->Username = $smtp_user; // SMTP username 
+					$mail->Password = $smtp_pass; // SMTP password
+					}
+					else $mail->IsMail();
 					$mail->CharSet = $modx->config['modx_charset'];
 					$mail->IsHTML($isHtml);
+					$mail->Sender	= $sender;
 					$mail->From		= ($autosender)? $autosender:$from;
 					$mail->FromName	= ($autoSenderName)?$autoSenderName:$fromname;
 					$mail->Subject	= $subject;
 					$mail->Body		= $autotext;
 					AddAddressToMailer($mail,"to",$fields['email']);
 					if(!$mail->send()) return 'AutoText: ' . $_lang['ef_mail_error'] . $mail->ErrorInfo;
-				}
-
+				}			
+				
 				//defaults to text - test for sendAsHtml
 				$isHTML = ($sendAsHTML==1 || strstr($sendAsHtml,'mobile'))?true:false;
 				# send mobile email
 				if ($mobile && $mobiletext) {
 					$mobiletext = formMerge($mobiletext,$fields);
 					$mail = new PHPMailer();
-					$mail->IsMail();
+					if($smtp) {			
+					$mail->IsSMTP(); // send via SMTP 
+					$mail->Host = $smtp_host; // SMTP servers 
+					$mail->Port = $smtp_port; // SMTP port 
+					$mail->SMTPAuth = $smtp_auth; // turn on SMTP authentication 
+					$mail->Username = $smtp_user; // SMTP username 
+					$mail->Password = $smtp_pass; // SMTP password
+					}
+					else $mail->IsMail();
 					$mail->CharSet = $modx->config['modx_charset'];
 					$mail->IsHTML($isHtml);
+					$mail->Sender	= $sender;
 					$mail->From		= $from;
 					$mail->FromName	= $fromname;
 					$mail->Subject	= $subject;
@@ -503,7 +634,7 @@ $debugText .= 'Locale<pre>'.var_export($localeInfo,true).'</pre>';
 					AddAddressToMailer($mail,"to",$mobile);
 					$mail->send();
 				}
-
+				
 			}//end test nomail
 			 # added in 1.4.2 - Protection against multiple submit with same form data
 			 if($protectSubmit) $_SESSION[$formid.'_hash'] = $hash; //hash is set earlier
@@ -540,6 +671,8 @@ $debugText .= 'Locale<pre>'.var_export($localeInfo,true).'</pre>';
 							if($fmt[2]=='html') $fields[$key] = str_replace("\n",'<br />',$fields[$key]);
 					}
 					$thankyou = formMerge($thankyou,$fields);
+					$modx->regClientScript(efLoadTemplate($popup));
+					
 					return $thankyou;
 				}else{
 					return $_lang['ef_thankyou_message'];
@@ -810,7 +943,10 @@ function  eFormParseTemplate($tpl, $isDebug=false ){
 					if( $fieldType=='text' && $tagAttributes['maxlength'] ){
 						$formats[$name][$_dfnMaxlength] == $tagAttributes['maxlength'];
 					}
-					if($formats[$name] && !$formats[$name][2]) $formats[$name][2]=($fieldType=='text')?"string":$fieldType;
+          // START PMS
+          // Default is now safestring
+          if($formats[$name] && !$formats[$name][2]) $formats[$name][2]=($fieldType=='text')?'safestring':$fieldType;
+          // END PMS
 					//populate automatic validation values for hidden, checkbox and radio fields
 					if($fieldType=='hidden'){
 						if(!$isDebug) $formats[$name][1] = "[undefined]"; //do not want to disclose hidden field names
@@ -1115,5 +1251,4 @@ function hasMailHeaders( &$fields ){
 	}
 	return ($injectionAttempt)?true:false;
 }
-
 ?>
