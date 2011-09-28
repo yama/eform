@@ -14,7 +14,7 @@ New SMTP snippet parameters have the following default values :
 
 Example minimal snippet call ...
 
-[!eForm?… &smtp=`true` &smtp_pass=`password` &smtp_host=`smtp.your-domian.co.uk`  …`!]
+[!eForm? ... &smtp=`true` &smtp_pass=`password` &smtp_host=`smtp.your-domian.co.uk` ... !]
 
 Optionally you can vary the smtp_port (integer), smtp_auth (true or false), smtp_user (if it's not the same as the MODx email sender)
 
